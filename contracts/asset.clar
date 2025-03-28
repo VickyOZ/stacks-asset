@@ -1,30 +1,558 @@
+;; StackAssets: Stacks-Backed Synthetic Assets
+;; Core contract that allows users to mint synthetic assets backed by Stacks
 
-;; title: asset
-;; version:
-;; summary:
-;; description:
+(define-constant contract-owner tx-sender)
+(define-constant err-owner-only (err u100))
+(define-constant err-insufficient-backing (err u101))
+(define-constant err-minimum-mint (err u102))
+(define-constant err-maximum-mint (err u103))
+(define-constant err-invalid-asset (err u104))
+(define-constant err-unsafe-ratio (err u105))
+(define-constant err-not-found (err u106))
+(define-constant err-unauthorized (err u107))
+(define-constant err-price-expired (err u108))
+(define-constant err-transfer-failed (err u109))
+(define-constant err-position-not-closed (err u110))
+(define-constant err-invalid-fee (err u111))
+(define-constant err-governance-only (err u112))
+(define-constant err-oracle-only (err u113))
+(define-constant err-paused (err u114))
+(define-constant err-cooldown-period (err u115))
 
-;; traits
-;;
+;; Define minimum backing ratio (150%)
+(define-constant min-backing-ratio u150)
 
-;; token definitions
-;;
+;; Define minimum and maximum mint amounts
+(define-constant min-mint-amount u100000000) ;; 1 STX
+(define-constant max-mint-amount u10000000000000) ;; 100,000 STX
 
-;; constants
-;;
+;; Price expiration time in blocks
+(define-constant price-expiration-blocks u144) ;; ~24 hours assuming 10-minute blocks
 
-;; data vars
-;;
+;; Protocol fee settings (basis points - 100 = 1%)
+(define-data-var minting-fee uint u50) ;; 0.5% fee on minting
+(define-data-var redemption-fee uint u25) ;; 0.25% fee on redemption
+(define-data-var liquidation-penalty uint u500) ;; 5% penalty on liquidation
 
-;; data maps
-;;
+;; Protocol revenue tracking
+(define-data-var total-protocol-fees uint u0)
 
-;; public functions
-;;
+;; Contract pause control
+(define-data-var contract-paused bool false)
 
-;; read only functions
-;;
+;; Governance control
+(define-map authorized-governance 
+  { admin: principal }
+  { can-update-params: bool }
+)
 
-;; private functions
-;;
+;; Oracle control
+(define-map authorized-oracles
+  { data-provider: principal }
+  { can-update-prices: bool }
+)
 
+;; Cooldown periods for operations (in blocks)
+(define-data-var redemption-cooldown uint u10) ;; ~100 minutes
+
+;; Define supported synthetic assets
+(define-map supported-assets
+  { token-id: (string-ascii 10) }
+  { 
+    is-active: bool,
+    decimals: uint
+  }
+)
+
+;; Define price feed directly in this contract
+(define-map asset-prices
+  { token-id: (string-ascii 10) }
+  {
+    price: uint,
+    last-updated: uint,
+    provider: principal
+  }
+)
+
+;; Track user positions
+(define-map user-positions
+  { user: principal, token-id: (string-ascii 10) }
+  {
+    backing-amount: uint,
+    synthetic-amount: uint,
+    creation-block: uint,
+    last-update-block: uint
+  }
+)
+
+;; Keep track of total amounts
+(define-map asset-totals
+  { token-id: (string-ascii 10) }
+  {
+    total-backing: uint,
+    total-synthetic: uint
+  }
+)
+
+;; Contract governance functions
+
+;; Add an admin
+(define-public (add-admin (admin principal))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (map-set authorized-governance
+      { admin: admin }
+      { can-update-params: true }
+    )
+    (ok true)
+  )
+)
+
+;; Remove an admin
+(define-public (remove-admin (admin principal))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (map-delete authorized-governance { admin: admin })
+    (ok true)
+  )
+)
+
+;; Add a data provider
+(define-public (add-data-provider (data-provider principal))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (map-set authorized-oracles
+      { data-provider: data-provider }
+      { can-update-prices: true }
+    )
+    (ok true)
+  )
+)
+
+;; Remove a data provider
+(define-public (remove-data-provider (data-provider principal))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (map-delete authorized-oracles { data-provider: data-provider })
+    (ok true)
+  )
+)
+
+;; Emergency pause contract
+(define-public (set-pause-state (paused bool))
+  (begin
+    (asserts! (is-authorized-admin) err-governance-only)
+    (var-set contract-paused paused)
+    (ok paused)
+  )
+)
+
+;; Update protocol fees
+(define-public (update-protocol-fees (new-minting-fee uint) (new-redemption-fee uint) (new-liquidation-penalty uint))
+  (begin
+    (asserts! (is-authorized-admin) err-governance-only)
+    ;; Validate fee ranges (max 5% for regular fees, max 10% for liquidation)
+    (asserts! (and (<= new-minting-fee u500) (<= new-redemption-fee u500)) err-invalid-fee)
+    (asserts! (<= new-liquidation-penalty u1000) err-invalid-fee)
+    
+    (var-set minting-fee new-minting-fee)
+    (var-set redemption-fee new-redemption-fee)
+    (var-set liquidation-penalty new-liquidation-penalty)
+    (ok true)
+  )
+)
+
+;; Update cooldown periods
+(define-public (update-cooldown-period (new-redemption-cooldown uint))
+  (begin
+    (asserts! (is-authorized-admin) err-governance-only)
+    (var-set redemption-cooldown new-redemption-cooldown)
+    (ok true)
+  )
+)
+
+;; Withdraw protocol fees
+(define-public (withdraw-protocol-fees (recipient principal))
+  (let
+    (
+      (fee-amount (var-get total-protocol-fees))
+    )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (> fee-amount u0) err-insufficient-backing)
+    
+    ;; Reset fees
+    (var-set total-protocol-fees u0)
+    
+    ;; Transfer fees to recipient
+    (try! (as-contract (stx-transfer? fee-amount (as-contract tx-sender) recipient)))
+    
+    (ok fee-amount)
+  )
+)
+
+;; Initialize supported synthetic assets
+(define-public (initialize-asset (token-id (string-ascii 10)) (decimals uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (map-set supported-assets
+      { token-id: token-id }
+      {
+        is-active: true,
+        decimals: decimals
+      }
+    )
+    (map-set asset-totals
+      { token-id: token-id }
+      {
+        total-backing: u0,
+        total-synthetic: u0
+      }
+    )
+    (ok true)
+  )
+)
+
+;; Update price feed (can be done by contract owner or authorized data providers)
+(define-public (update-price (token-id (string-ascii 10)) (price uint))
+  (let
+    (
+      (asset (unwrap! (get-asset-info token-id) err-invalid-asset))
+      (current-price-data (default-to 
+                            { price: u0, last-updated: u0, provider: contract-owner }
+                            (map-get? asset-prices { token-id: token-id })))
+    )
+    ;; Check if data provider is authorized
+    (asserts! (is-authorized-data-provider) err-oracle-only)
+    (asserts! (is-eq (get is-active asset) true) err-invalid-asset)
+    
+    ;; Set the new price
+    (map-set asset-prices
+      { token-id: token-id }
+      {
+        price: price,
+        last-updated: block-height,
+        provider: tx-sender
+      }
+    )
+    
+    (ok price)
+  )
+)
+
+;; Get price from the internal price feed
+(define-read-only (get-asset-price (token-id (string-ascii 10)))
+  (let
+    (
+      (price-data (unwrap! (map-get? asset-prices { token-id: token-id }) err-invalid-asset))
+      (last-updated (get last-updated price-data))
+      (price-age (- block-height last-updated))
+    )
+    ;; Check if price is fresh enough
+    (asserts! (< price-age price-expiration-blocks) err-price-expired)
+    
+    (ok {
+      price: (get price price-data),
+      last-updated: last-updated
+    })
+  )
+)
+
+;; Helper to calculate fee
+(define-read-only (calculate-fee (amount uint) (fee-rate uint))
+  (/ (* amount fee-rate) u10000)
+)
+
+;; Create a new synthetic position
+(define-public (mint-synthetic 
+    (token-id (string-ascii 10)) 
+    (backing-amount uint) 
+    (synthetic-amount uint))
+  (let
+    (
+      (asset (unwrap! (get-asset-info token-id) err-invalid-asset))
+      (price-result (unwrap! (get-asset-price token-id) err-invalid-asset))
+      (asset-price (get price price-result))
+      (fee-amount (calculate-fee backing-amount (var-get minting-fee)))
+      (effective-backing (- backing-amount fee-amount))
+      (backing-value (* effective-backing u100000000))
+      (synthetic-value (* synthetic-amount asset-price))
+      (backing-ratio (/ (* backing-value u100) synthetic-value))
+      (user-key { user: tx-sender, token-id: token-id })
+      (asset-key { token-id: token-id })
+      (existing-totals (default-to { total-backing: u0, total-synthetic: u0 } 
+                      (map-get? asset-totals asset-key)))
+      (existing-position (map-get? user-positions user-key))
+    )
+    ;; Check if contract is paused
+    (asserts! (not (var-get contract-paused)) err-paused)
+    
+    ;; Check if synthetic position would be valid
+    (asserts! (>= synthetic-amount min-mint-amount) err-minimum-mint)
+    (asserts! (<= synthetic-amount max-mint-amount) err-maximum-mint)
+    (asserts! (>= backing-ratio min-backing-ratio) err-insufficient-backing)
+    (asserts! (is-eq (get is-active asset) true) err-invalid-asset)
+    
+    ;; Transfer backing from user to contract
+    (try! (stx-transfer? backing-amount tx-sender (as-contract tx-sender)))
+    
+    ;; Update protocol fees
+    (var-set total-protocol-fees (+ (var-get total-protocol-fees) fee-amount))
+    
+    ;; Create or update position
+    (match existing-position
+      existing-pos ;; Update existing position
+      (map-set user-positions
+        user-key
+        {
+          backing-amount: (+ (get backing-amount existing-pos) effective-backing),
+          synthetic-amount: (+ (get synthetic-amount existing-pos) synthetic-amount),
+          creation-block: (get creation-block existing-pos),
+          last-update-block: block-height
+        }
+      )
+      ;; Create new position
+      (map-set user-positions
+        user-key
+        {
+          backing-amount: effective-backing,
+          synthetic-amount: synthetic-amount,
+          creation-block: block-height,
+          last-update-block: block-height
+        }
+      )
+    )
+    
+    ;; Update asset totals
+    (map-set asset-totals
+      asset-key
+      {
+        total-backing: (+ (get total-backing existing-totals) effective-backing),
+        total-synthetic: (+ (get total-synthetic existing-totals) synthetic-amount)
+      }
+    )
+    
+    ;; Return success
+    (ok synthetic-amount)
+  )
+)
+
+;; Add backing to an existing position
+(define-public (add-backing (token-id (string-ascii 10)) (amount uint))
+  (let
+    (
+      (user-key { user: tx-sender, token-id: token-id })
+      (position (unwrap! (map-get? user-positions user-key) err-not-found))
+      (asset-key { token-id: token-id })
+      (existing-totals (default-to { total-backing: u0, total-synthetic: u0 }
+                      (map-get? asset-totals asset-key)))
+      (new-backing-amount (+ (get backing-amount position) amount))
+    )
+    ;; Check if contract is paused
+    (asserts! (not (var-get contract-paused)) err-paused)
+    
+    ;; Transfer additional backing
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    ;; Update position
+    (map-set user-positions
+      user-key
+      {
+        backing-amount: new-backing-amount,
+        synthetic-amount: (get synthetic-amount position),
+        creation-block: (get creation-block position),
+        last-update-block: block-height
+      }
+    )
+    
+    ;; Update asset totals
+    (map-set asset-totals
+      asset-key
+      {
+        total-backing: (+ (get total-backing existing-totals) amount),
+        total-synthetic: (get total-synthetic existing-totals)
+      }
+    )
+    
+    (ok new-backing-amount)
+  )
+)
+
+;; Redeem synthetic assets and reclaim backing
+(define-public (redeem-synthetic (token-id (string-ascii 10)) (synthetic-amount uint))
+  (let
+    (
+      (user-key { user: tx-sender, token-id: token-id })
+      (position (unwrap! (map-get? user-positions user-key) err-not-found))
+      (asset-key { token-id: token-id })
+      (existing-totals (default-to { total-backing: u0, total-synthetic: u0 }
+                       (map-get? asset-totals asset-key)))
+      (position-synthetic (get synthetic-amount position))
+      (position-backing (get backing-amount position))
+      (last-update (get last-update-block position))
+      (blocks-since-update (- block-height last-update))
+    )
+    ;; Check if contract is paused
+    (asserts! (not (var-get contract-paused)) err-paused)
+    
+    ;; Check redemption cooldown period
+    (asserts! (>= blocks-since-update (var-get redemption-cooldown)) err-cooldown-period)
+    
+    ;; Check if user has enough synthetic assets
+    (asserts! (<= synthetic-amount position-synthetic) err-insufficient-backing)
+    
+    ;; Calculate backing to return based on the proportion of synthetic being redeemed
+    (let
+      (
+        (redemption-ratio (/ (* synthetic-amount u100000000) position-synthetic))
+        (backing-to-return (/ (* position-backing redemption-ratio) u100000000))
+        (fee-amount (calculate-fee backing-to-return (var-get redemption-fee)))
+        (net-backing-return (- backing-to-return fee-amount))
+        (remaining-synthetic (- position-synthetic synthetic-amount))
+        (remaining-backing (- position-backing backing-to-return))
+      )
+      ;; Update protocol fees
+      (var-set total-protocol-fees (+ (var-get total-protocol-fees) fee-amount))
+      
+      ;; If redeeming all, delete the position
+      (if (is-eq remaining-synthetic u0)
+        (begin
+          (map-delete user-positions user-key)
+          
+          ;; Update asset totals
+          (map-set asset-totals
+            asset-key
+            {
+              total-backing: (- (get total-backing existing-totals) position-backing),
+              total-synthetic: (- (get total-synthetic existing-totals) position-synthetic)
+            }
+          )
+        )
+        (begin
+          ;; Update position with remaining amounts
+          (map-set user-positions
+            user-key
+            {
+              backing-amount: remaining-backing,
+              synthetic-amount: remaining-synthetic,
+              creation-block: (get creation-block position),
+              last-update-block: block-height
+            }
+          )
+          
+          ;; Update asset totals
+          (map-set asset-totals
+            asset-key
+            {
+              total-backing: (- (get total-backing existing-totals) backing-to-return),
+              total-synthetic: (- (get total-synthetic existing-totals) synthetic-amount)
+            }
+          )
+        )
+      )
+      
+      ;; Transfer backing back to user
+      (try! (as-contract (stx-transfer? net-backing-return (as-contract tx-sender) tx-sender)))
+      
+      (ok {
+        synthetic-redeemed: synthetic-amount,
+        backing-returned: net-backing-return,
+        fee-paid: fee-amount
+      })
+    )
+  )
+)
+
+;; Get backing ratio helper function
+(define-read-only (calculate-backing-ratio (backing-amount uint) (synthetic-amount uint) (asset-price uint))
+  (let
+    (
+      (backing-value (* backing-amount u100000000))
+      (synthetic-value (* synthetic-amount asset-price))
+    )
+    (/ (* backing-value u100) synthetic-value)
+  )
+)
+
+;; Helper functions for internal authorization checks
+(define-read-only (is-authorized-admin)
+  (or 
+    (is-eq tx-sender contract-owner)
+    (is-some (map-get? authorized-governance { admin: tx-sender }))
+  )
+)
+
+(define-read-only (is-authorized-data-provider)
+  (or 
+    (is-eq tx-sender contract-owner)
+    (is-some (map-get? authorized-oracles { data-provider: tx-sender }))
+  )
+)
+
+;; Read-only functions for UI
+(define-read-only (get-position (user principal) (token-id (string-ascii 10)))
+  (map-get? user-positions { user: user, token-id: token-id })
+)
+
+;; Get position info for a user
+(define-read-only (get-position-info (user principal) (token-id (string-ascii 10)))
+  (let
+    (
+      (position (unwrap! (map-get? user-positions { user: user, token-id: token-id }) err-not-found))
+    )
+    (ok {
+      backing-amount: (get backing-amount position),
+      synthetic-amount: (get synthetic-amount position),
+      creation-block: (get creation-block position),
+      last-update-block: (get last-update-block position)
+    })
+  )
+)
+
+;; Public function that can be called to check the backing ratio
+(define-public (check-backing-ratio (user principal) (token-id (string-ascii 10)))
+  (let
+    (
+      (position (unwrap! (map-get? user-positions { user: user, token-id: token-id }) err-not-found))
+      (price-result (unwrap! (get-asset-price token-id) err-invalid-asset))
+      (asset-price (get price price-result))
+    )
+    (ok (calculate-backing-ratio 
+          (get backing-amount position) 
+          (get synthetic-amount position) 
+          asset-price))
+  )
+)
+
+(define-read-only (get-asset-info (token-id (string-ascii 10)))
+  (map-get? supported-assets { token-id: token-id })
+)
+
+(define-read-only (get-asset-stats (token-id (string-ascii 10)))
+  (map-get? asset-totals { token-id: token-id })
+)
+
+(define-read-only (get-current-price (token-id (string-ascii 10)))
+  (map-get? asset-prices { token-id: token-id })
+)
+
+;; Protocol info functions
+(define-read-only (get-protocol-fees)
+  (var-get total-protocol-fees)
+)
+
+(define-read-only (get-fee-rates)
+  {
+    minting-fee: (var-get minting-fee),
+    redemption-fee: (var-get redemption-fee),
+    liquidation-penalty: (var-get liquidation-penalty)
+  }
+)
+
+(define-read-only (get-protocol-settings)
+  {
+    paused: (var-get contract-paused),
+    min-backing-ratio: min-backing-ratio,
+    redemption-cooldown: (var-get redemption-cooldown),
+    price-expiration: price-expiration-blocks
+  }
+)
